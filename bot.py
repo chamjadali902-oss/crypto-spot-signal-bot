@@ -1,8 +1,9 @@
 import requests
 import pandas as pd
 from datetime import datetime
+import traceback
 
-# ============ CONFIG ============
+# ================= CONFIG =================
 BOT_TOKEN = "8408138871:AAEAFLXN-0_NX4f94DRTCfXAIY7IK5GDYmY"
 CHAT_ID = "8565460915"
 
@@ -11,7 +12,7 @@ TIMEFRAME = "5m"
 LIMIT = 120
 TOP = 100
 
-# ============ TELEGRAM ============
+# ================= TELEGRAM =================
 def tg(msg):
     try:
         requests.post(
@@ -22,8 +23,8 @@ def tg(msg):
     except:
         pass
 
-# ============ BINANCE ============
-def klines(symbol, interval, limit):
+# ================= BINANCE =================
+def get_klines(symbol, interval, limit):
     try:
         r = requests.get(
             f"{BASE_URL}/api/v3/klines",
@@ -33,94 +34,133 @@ def klines(symbol, interval, limit):
         if r.status_code != 200:
             return None
 
-        df = pd.DataFrame(r.json(), columns=[
+        data = r.json()
+        if not data or len(data) < 50:
+            return None
+
+        df = pd.DataFrame(data, columns=[
             "t","o","h","l","c","v","_","_","_","_","_","_"
         ])
         df = df[["o","h","l","c","v"]].astype(float)
         df.columns = ["open","high","low","close","volume"]
         return df
+
     except:
         return None
 
-def tickers():
+def get_tickers():
     try:
-        return requests.get(f"{BASE_URL}/api/v3/ticker/24hr", timeout=10).json()
+        r = requests.get(f"{BASE_URL}/api/v3/ticker/24hr", timeout=10)
+        return r.json()
     except:
         return []
 
-# ============ INDICATORS ============
+# ================= INDICATORS =================
 def EMA(s, p):
     return s.ewm(span=p, adjust=False).mean()
 
 def RSI(s, p=14):
-    d = s.diff()
-    g = d.clip(lower=0)
-    l = -d.clip(upper=0)
-    ag = g.rolling(p).mean()
-    al = l.rolling(p).mean()
-    rs = ag / al
+    delta = s.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(p).mean()
+    avg_loss = loss.rolling(p).mean()
+    rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-# ============ BTC FILTER ============
+# ================= BTC FILTER =================
 def btc_safe():
-    df = klines("BTCUSDT", "15m", 100)
+    df = get_klines("BTCUSDT", "15m", 100)
     if df is None:
         return False
-    ema = EMA(df["close"], 100).iloc[-1]
     price = df["close"].iloc[-1]
-    return price >= ema * 0.99
+    ema100 = EMA(df["close"], 100).iloc[-1]
+    return price >= ema100 * 0.99
 
-# ============ STRATEGIES ============
-def trend(df):
-    s, r = 0, []
-    if EMA(df["close"],9).iloc[-1] > EMA(df["close"],21).iloc[-1]:
-        s+=1; r.append("EMA9>EMA21")
-    if EMA(df["close"],21).iloc[-1] > EMA(df["close"],50).iloc[-1]:
-        s+=1; r.append("EMA21>EMA50")
-    if 45 <= RSI(df["close"]).iloc[-1] <= 70:
-        s+=1; r.append("RSI healthy")
+# ================= STRATEGIES =================
+def continuation(df):
+    score = 0
+    reasons = []
+
+    if EMA(df["close"], 9).iloc[-1] > EMA(df["close"], 21).iloc[-1]:
+        score += 1; reasons.append("EMA9>EMA21")
+
+    if EMA(df["close"], 21).iloc[-1] > EMA(df["close"], 50).iloc[-1]:
+        score += 1; reasons.append("EMA21>EMA50")
+
+    rsi = RSI(df["close"]).iloc[-1]
+    if 45 <= rsi <= 70:
+        score += 1; reasons.append("RSI healthy")
+
     if df["volume"].iloc[-1] > df["volume"].rolling(20).mean().iloc[-1]:
-        s+=1; r.append("Volume spike")
+        score += 1; reasons.append("Volume spike")
+
     if btc_safe():
-        s+=1; r.append("BTC safe")
-    return s, r
+        score += 1; reasons.append("BTC trend OK")
+
+    return score, reasons
 
 def reversal(df):
-    s, r = 0, []
+    score = 0
+    reasons = []
     rsi = RSI(df["close"])
+
     if rsi.iloc[-2] < 35 and rsi.iloc[-1] > rsi.iloc[-2]:
-        s+=1; r.append("RSI bounce")
-    if EMA(df["close"],9).iloc[-1] > EMA(df["close"],21).iloc[-1]:
-        s+=1; r.append("EMA cross")
-    if df["volume"].iloc[-1] > df["volume"].rolling(20).mean().iloc[-1]:
-        s+=1; r.append("Volume spike")
+        score += 1; reasons.append("RSI bounce")
+
+    if EMA(df["close"], 9).iloc[-1] > EMA(df["close"], 21).iloc[-1]:
+        score += 1; reasons.append("EMA reversal")
+
     if df["close"].iloc[-1] > df["close"].iloc[-2]:
-        s+=1; r.append("Green candle")
-    return s, r
+        score += 1; reasons.append("Green candle")
 
-# ============ MAIN ============
-def run():
-    tg("🔁 Fresh Dual Strategy Scan Started")
+    if df["volume"].iloc[-1] > df["volume"].rolling(20).mean().iloc[-1]:
+        score += 1; reasons.append("Volume spike")
 
-    data = tickers()
-    usdt = [c for c in data if c.get("symbol","").endswith("USDT")]
+    return score, reasons
 
-    # TOP VOLUME → CONTINUATION
+# ================= MAIN =================
+def main():
+    tg("🚀 Crypto Spot Dual Engine STARTED")
+
+    tickers = get_tickers()
+    usdt = [c for c in tickers if c.get("symbol","").endswith("USDT")]
+
+    # CONTINUATION (Top Volume)
     for c in sorted(usdt, key=lambda x: float(x.get("quoteVolume",0)), reverse=True)[:TOP]:
-        df = klines(c["symbol"], TIMEFRAME, LIMIT)
-        if df is None: continue
-        s,r = trend(df)
-        if s>=3:
-            tg(f"📈 CONTINUATION\n{c['symbol']}\nScore {s}/5\n" + " | ".join(r))
+        df = get_klines(c["symbol"], TIMEFRAME, LIMIT)
+        if df is None:
+            continue
 
-    # TOP LOSERS → REVERSAL
+        score, reasons = continuation(df)
+        if score >= 3:
+            tg(
+                f"📈 CONTINUATION\n"
+                f"{c['symbol']}\n"
+                f"Score: {score}/5\n"
+                f"{' | '.join(reasons)}"
+            )
+
+    # REVERSAL (Top Losers)
     for c in sorted(usdt, key=lambda x: float(x.get("priceChangePercent",0)))[:TOP]:
-        df = klines(c["symbol"], TIMEFRAME, LIMIT)
-        if df is None: continue
-        s,r = reversal(df)
-        if s>=3:
-            tg(f"🔄 REVERSAL\n{c['symbol']}\n24h {c['priceChangePercent']}%\n" + " | ".join(r))
+        df = get_klines(c["symbol"], TIMEFRAME, LIMIT)
+        if df is None:
+            continue
 
+        score, reasons = reversal(df)
+        if score >= 3:
+            tg(
+                f"🔄 REVERSAL\n"
+                f"{c['symbol']}\n"
+                f"24h: {c['priceChangePercent']}%\n"
+                f"{' | '.join(reasons)}"
+            )
+
+# ================= SAFE RUN =================
 if __name__ == "__main__":
-    tg("🚀 Fresh Crypto Spot Engine STARTED")
-    run()
+    try:
+        main()
+        print("Bot run completed successfully")
+    except Exception as e:
+        print("Fatal error:", e)
+        traceback.print_exc()
